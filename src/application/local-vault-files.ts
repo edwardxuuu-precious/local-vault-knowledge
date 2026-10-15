@@ -6,6 +6,12 @@ import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 
 export const digest = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
+export async function workspaceFingerprint(path: string): Promise<string> {
+  if (typeof path !== "string" || !isAbsolute(path)) throw new Error("An explicit absolute origin workspace is required");
+  const root = await realpath(path);
+  if (!(await lstat(root)).isDirectory()) throw new Error("Origin workspace must be an existing directory");
+  return "workspace:" + digest(root).slice(0, 24);
+}
 export function stable(value: unknown): string {
   return JSON.stringify(value, (_, item: unknown) => item && typeof item === "object" && !Array.isArray(item)
     ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);

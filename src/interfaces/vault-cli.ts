@@ -5,6 +5,8 @@ import { exportPrivatePackage, exportPublicPackage, importPackage, inspectPackag
   previewReturnedEdits, type PublicDraft } from "../application/local-vault-pack.js";
 import { refreshLocalNavigation } from "../application/local-vault-navigation.js";
 import { applyOrganization, previewOrganization, type OrganizationPreview } from "../application/local-vault-organization.js";
+import { previewCaptureFiles, applyCapture, type CaptureDraft, type CapturePreview } from "../application/local-vault-capture.js";
+import { runLocalKnowledgeHook, knowledgeHookUnavailable } from "../application/local-knowledge-hook.js";
 
 export function registerVaultCommands(program: Command) {
   const vault = program.command("vault").description("Local-first knowledge tools; no Router hooks, lifecycle or background writes");
@@ -14,6 +16,17 @@ export function registerVaultCommands(program: Command) {
   };
   const open = () => LocalVault.open(root());
   const render = (value: unknown): void => { process.stdout.write(JSON.stringify(value, null, 2) + "\n"); };
+  vault.command("knowledge-hook").option("--max-hits <number>", "One to three references", "2")
+    .option("--max-context-chars <number>", "1000 to 4000 characters", "2400")
+    .action(async options => {
+      let input = "";
+      process.stdin.setEncoding("utf8");
+      for await (const chunk of process.stdin) {
+        input += String(chunk); if (Buffer.byteLength(input) > 131072) { render(knowledgeHookUnavailable()); return; }
+      }
+      try { render(await runLocalKnowledgeHook(JSON.parse(input), root(), { maxHits: Number(options.maxHits), maxContextChars: Number(options.maxContextChars) })); }
+      catch { render(knowledgeHookUnavailable()); }
+    });
   vault.command("init").requiredOption("--destination <new-directory>").requiredOption("--confirm-new-vault")
     .action(async options => {
       render(await initializeLocalVault(options.destination));
@@ -26,6 +39,12 @@ export function registerVaultCommands(program: Command) {
     .action(async (q, options) => render(await (await open()).buildContext(q, options.workspace, options.project)));
   vault.command("change-preview").argument("<id>").requiredOption("--base-hash <hash>").requiredOption("--file <path>")
     .action(async (id, options) => render((await open()).previewChange(id, options.baseHash, await readFile(options.file, "utf8"))));
+  vault.command("capture-preview").requiredOption("--file <draft-json>", "One to five proposed knowledge changes")
+    .action(async options => render(await previewCaptureFiles(await open(), JSON.parse(await readFile(options.file, "utf8")) as CaptureDraft[])));
+  vault.command("capture-save").requiredOption("--preview <reviewed-json>").requiredOption("--expected-preview-hash <hash>")
+    .requiredOption("--confirm", "Use only after the user confirms these exact changes")
+    .action(async options => render(await applyCapture(await open(), JSON.parse(await readFile(options.preview, "utf8")) as CapturePreview,
+      options.expectedPreviewHash, Boolean(options.confirm))));
   vault.command("refresh").description("Refresh navigation and default reading scope; existing current bodies are preserved")
     .action(async () => render(await refreshLocalNavigation(await open())));
   vault.command("organize-preview").action(async () => render(await previewOrganization(await open())));

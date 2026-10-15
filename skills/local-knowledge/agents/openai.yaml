@@ -1,0 +1,6 @@
+interface:
+  display_name: "本地资料与经验"
+  short_description: "相关项目主动查经验，确认后保存关键资料与事实，复用后更新结果"
+  default_prompt: "使用 $local-knowledge 为当前项目查找相关经验，并提出需要确认的关键知识更新。"
+policy:
+  allow_implicit_invocation: true

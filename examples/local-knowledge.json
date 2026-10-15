@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "readerRoot": "/absolute/path/local-vault-knowledge",
+  "hook": {
+    "enabled": false,
+    "maxHits": 2,
+    "maxContextChars": 2400,
+    "timeoutMs": 4000
+  }
+}

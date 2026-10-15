@@ -2,7 +2,8 @@ import { access, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import matter from "gray-matter";
 import YAML from "yaml";
-import { detachedSqlite, digest, inside, regular, stable, walk } from "./local-vault-files.js";
+import { detachedSqlite, digest, inside, regular, stable, walk, workspaceFingerprint } from "./local-vault-files.js";
+import { readMemoryDocuments } from "./local-vault-memory.js";
 
 type Dictionary = Record<string, unknown>;
 export interface LocalNote {
@@ -11,11 +12,12 @@ export interface LocalNote {
   privacy: string; originalStatus: string; currentCanonicalStatus: string | null; status: "unverified" | "original" | "conflict";
   edited: boolean; sourceChanged: boolean; sourceRefs: string[]; boundaries: string; openItems: string;
   aliases: string[]; issues: string[]; protectedFields: Dictionary; createdAt: string | null; historical: boolean;
-  asOf: string | null; sourceUpdatedAt: string | null; sourceContentCoverage: "not_assessed";
+  asOf: string | null; sourceUpdatedAt: string | null; sourceContentCoverage: "not_assessed" | "link_only" | "excerpt" | "full" | "project_result";
+  canonicalObjects: Array<{ id: string; project: string; status: string }>;
   resolvedSourceRefs: Array<{ original: string; resolved: string | null }>;
 }
 interface CanonicalDocument { id: string; project_id: string; status: string; privacy_class: string; source_ref: string; updated_at: string }
-interface Project { id: string; name: string; root: string; truthFiles?: string[] }
+interface Project { id: string; name: string; root: string; truthFiles?: Array<string | { path: string; kind?: string }> }
 interface ManifestRecord {
   metadata: { id: string; objectIds: string[]; sourceRef?: string; sourceStatus?: string };
   baselineBodyHash: string; latestSourceBodyHash: string; protectedFrontmatter?: Dictionary;
@@ -53,7 +55,7 @@ export class LocalVault {
     readonly projects: Project[], readonly globalProjects: string[], readonly notes: LocalNote[], readonly conflicts: LocalConflict[],
     readonly role: string) {}
 
-  static async open(input: string): Promise<LocalVault> {
+  static async open(input: string, options: { canonicalReadMode?: "detached" | "memory"; currentReadingOnly?: boolean } = {}): Promise<LocalVault> {
     if (!input) throw new Error("An explicit Vault or configured locator root is required");
     let base = await realpath(resolve(input));
     const readJson = async (path: string) => JSON.parse(await readFile(path, "utf8")) as Dictionary;
@@ -106,14 +108,19 @@ export class LocalVault {
         if (e.code === "ENOENT") return "spaces: []"; throw e;
       })) as { spaces: Array<{ projectId: string; discovery: string }> };
       globalProjects = spaces.spaces?.filter(s => s.discovery === "global_discovery").map(s => s.projectId) ?? [];
-      await detachedSqlite(join(system, "runtime/knowledge.sqlite"), db => {
-        for (const row of db.prepare("SELECT id, project_id, status, privacy_class, source_ref, updated_at FROM documents").all()) {
+      const addDocuments = (rows: Array<unknown>) => {
+        for (const row of rows) {
           const document = row as unknown as CanonicalDocument; documents.set(document.id, document);
         }
+      };
+      if (options.canonicalReadMode === "memory") addDocuments(await readMemoryDocuments(join(system, "runtime/knowledge.sqlite")));
+      else await detachedSqlite(join(system, "runtime/knowledge.sqlite"), db => {
+        addDocuments(db.prepare("SELECT id, project_id, status, privacy_class, source_ref, updated_at FROM documents").all());
       });
     }
     const notes: LocalNote[] = [];
-    for (const path of await walk(base, p => p.startsWith("90_系统/") || p === "90_系统" || p.startsWith("99_归档") || p.split("/").some(x => x.startsWith(".")))) {
+    for (const path of await walk(base, p => p.startsWith("90_系统/") || p === "90_系统" || p.startsWith("99_归档")
+      || Boolean(options.currentReadingOnly && excludedReading(p)) || p.split("/").some(x => x.startsWith(".")))) {
       if (!path.endsWith(".md") || /(^|\/)(首页|索引|如何使用)\.md$/u.test(path)) continue;
       const raw = await readFile(await regular(base, path), "utf8");
       if (/^---\r?\n/u.test(raw) && !/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/u.test(raw)) throw new Error("Malformed frontmatter: " + path);
@@ -143,7 +150,9 @@ export class LocalVault {
       const privacy = indexed.some(d => d.privacy_class === "restricted") ? "restricted"
         : String(data.privacyClass ?? data.privacy ?? "internal");
       const historical = excludedReading(path);
-      const sourceRefs = [...new Set([...list(meta.sourceRef), ...indexed.map(x => x.source_ref),
+      const workingSources = Array.isArray(data.sources) ? data.sources.flatMap(source => typeof source === "string" ? [source]
+        : typeof dict(source).ref === "string" ? [dict(source).ref as string] : []) : [];
+      const sourceRefs = [...new Set([...list(meta.sourceRef), ...workingSources, ...list(data.source_refs), ...indexed.map(x => x.source_ref),
         ...(body.match(/\[\[[^\]|]+/gu) ?? []).map(x => x.slice(2)).filter(x => x.startsWith("90_"))])];
       const resolvedSourceRefs = sourceRefs.map(original => {
         if (/^https?:\/\//u.test(original)) return { original, resolved: original };
@@ -169,9 +178,11 @@ export class LocalVault {
         edited, sourceChanged, sourceRefs, resolvedSourceRefs,
         boundaries: section(body, /^## (?:适用|使用边界|实际适用|范围|例外|什么时候)/u), openItems: section(body, /^## .*?(?:未结|待确认|遗留)/u),
         aliases: list(data.aliases), issues, protectedFields, createdAt: typeof data.created_at === "string" ? data.created_at : originalDates.get(id) ?? null, historical,
-        asOf: body.match(/截至\s*(\d{4}-\d{2}-\d{2})/u)?.[1] ?? null,
+        asOf: typeof data.observed_at === "string" ? data.observed_at : body.match(/截至\s*(\d{4}-\d{2}-\d{2})/u)?.[1] ?? null,
         sourceUpdatedAt: indexed[0]?.updated_at ?? body.match(/最近更新：([^\s]+)/u)?.[1] ?? null,
-        sourceContentCoverage: "not_assessed",
+        canonicalObjects: indexed.map(d => ({ id: d.id, project: d.project_id, status: d.status })),
+        sourceContentCoverage: ["link_only", "excerpt", "full", "project_result"].includes(String(data.source_content_coverage))
+          ? data.source_content_coverage as LocalNote["sourceContentCoverage"] : "not_assessed",
       });
     }
     const identityCounts = new Map<string, number>();
@@ -216,16 +227,19 @@ export class LocalVault {
     if (!query.trim() || !Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error("Query and bounded limit are required");
     const q = expanded(query), results: LocalHit[] = [], candidates = this.notes.filter(n => this.visible(n, project));
     const frequencies = new Map<string, number>();
-    for (const n of candidates) for (const t of new Set(terms(n.body + " " + n.aliases.join(" ")))) frequencies.set(t, (frequencies.get(t) ?? 0) + 1);
-    const weight = (t: string) => Math.log(1 + (candidates.length + 1) / ((frequencies.get(t) ?? 0) + 1));
+    for (const n of candidates) for (const t of new Set(terms(n.body + " " + n.title + " " + n.aliases.join(" ")))) frequencies.set(t, (frequencies.get(t) ?? 0) + 1);
+    const weight = (t: string) => Math.log(1 + (candidates.length - (frequencies.get(t) ?? 0) + 0.5) / ((frequencies.get(t) ?? 0) + 0.5));
     for (const note of candidates) {
       const titleTerms = new Set(terms(note.title + " " + note.aliases.join(" ")));
+      const titleHits = q.filter(t => titleTerms.has(t)).reduce((a, t) => a + weight(t), 0) / Math.sqrt(Math.max(titleTerms.size, 4));
       let best = { score: 0, snippet: "", heading: "" };
       for (const chunk of note.body.split(/(?=^#{1,3} )/mu)) {
-        const values = new Set(terms(chunk)), heading = chunk.split("\n")[0]?.replace(/^#+ /u, "") ?? note.title;
+        const content = chunk.replace(/^#{1,3} .*$/gmu, "").trim();
+        if (!content) continue;
+        const values = new Set(terms(content)), heading = chunk.split("\n")[0]?.replace(/^#+ /u, "") ?? note.title;
         const hits = q.filter(t => values.has(t)).reduce((a, t) => a + weight(t), 0);
-        const titleHits = q.filter(t => titleTerms.has(t)).reduce((a, t) => a + weight(t), 0);
-        const score = (hits + titleHits * 3) / Math.sqrt(Math.max(values.size, 10));
+        const score = (hits / Math.sqrt(Math.max(values.size, 30)) + titleHits * 1.2)
+          * (project && note.projects.includes(project) ? 1.6 : 1);
         if (score > best.score) best = { score, snippet: chunk.trim().slice(0, 1000), heading };
       }
       if (best.score > 0) {
@@ -247,26 +261,37 @@ export class LocalVault {
     const project = projectId ? this.projects.find(p => p.id === projectId) : workspacePath
       ? this.projects.filter(p => containsPath(resolve(p.root), resolve(workspacePath))).sort((a, b) => b.root.length - a.root.length)[0] : undefined;
     if (projectId && !project) throw new Error("Unknown project ID; refusing guessed scope");
-    const hits = this.search(query, project?.id).filter(n => project || n.kind === "personal"
-      || n.projects.includes("*") || n.projects.some(p => this.globalProjects.includes(p)));
+    const originWorkspace = !project && workspacePath ? await workspaceFingerprint(workspacePath).catch(() => null) : null;
+    const hits = this.search(query, project?.id ?? originWorkspace ?? undefined).filter(n => project || n.kind === "personal"
+      || n.projects.includes("*") || n.projects.some(p => this.globalProjects.includes(p)) || (originWorkspace !== null && n.projects.includes(originWorkspace)));
     const warnings: string[] = [];
-    if (!project) warnings.push("当前项目未绑定；项目限定经验不作为本任务上下文。");
+    if (!project) warnings.push("当前项目未登记；仅使用通用参考和同工作区的待验证经验，项目真源须另外核对。");
+    if (hits.some(n => n.projects.some(p => p.startsWith("workspace:"))))
+      warnings.push("未登记工作区经验仅在原工作区用于 test_only + reversible_trial_only，不作为已验证通用规则。");
     let projectRootAvailable = false;
-    const truthRefs: Array<{ path: string; available: boolean; hash: string | null; body: string | null }> = [];
+    const truthRefs: Array<{ path: string; available: boolean; hash: string | null; body: string | null; unavailableReason: string | null }> = [];
     if (project) {
       projectRootAvailable = this.role === "primary" && await access(project.root).then(() => true, () => false);
       if (!projectRootAvailable) warnings.push("当前项目真源不可用；相关资料仅作历史参考。");
       if ((project.truthFiles?.length ?? 0) > 8) throw new Error("Truth file read budget exceeds eight explicit files");
-      for (const path of project.truthFiles ?? []) {
+      for (const locator of project.truthFiles ?? []) {
+        const path = typeof locator === "string" ? locator : locator?.path;
+        if (typeof path !== "string" || !path.trim()) throw new Error("Invalid configured truth file locator");
         try {
           if (!projectRootAvailable) throw new Error("Current project truth is unavailable");
           if (/(^|\/)(\.env[^/]*|[^/]*(?:credential|secret|private-key)[^/]*)$/iu.test(path)) throw new Error("Sensitive truth locator");
           const target = await regular(project.root, path);
           const raw = await readFile(target, "utf8");
-          if (raw.length > 12000 || /(?:api[_-]?key|password|secret)\s*[:=]\s*["']?[A-Za-z0-9_-]{12,}|Bearer\s+\S+/iu.test(raw))
-            throw new Error("Truth file requires narrower safe reference");
-          truthRefs.push({ path: target, available: true, hash: digest(raw), body: raw });
-        } catch { truthRefs.push({ path: join(project.root, path), available: false, hash: null, body: null }); }
+          if (raw.length > 12000) throw new Error("超过12000字符的单文件读取上限，应直接核对相关章节");
+          if (/(?:api[_-]?key|password|secret)\s*[:=]\s*["']?[A-Za-z0-9_-]{12,}|Bearer\s+\S+/iu.test(raw))
+            throw new Error("检测到可能的凭据内容，需缩小到安全真源范围");
+          truthRefs.push({ path: target, available: true, hash: digest(raw), body: raw, unavailableReason: null });
+        } catch (error) {
+          const reason = (error as NodeJS.ErrnoException)?.code === "ENOENT" ? "文件不存在"
+            : error instanceof Error ? error.message : "无法读取";
+          truthRefs.push({ path: join(project.root, path), available: false, hash: null, body: null, unavailableReason: reason });
+          warnings.push(path + " 未读入：" + reason + "。不能把相关知识摘要当作当前真源。");
+        }
       }
       if (!truthRefs.length) warnings.push("项目只提供真源位置，未配置具体真源文件；使用前应读取项目当前事实。");
     }
@@ -276,7 +301,7 @@ export class LocalVault {
       warnings.push(hit.title + " 的原来源已过期或发生变化，需重新核对。");
     for (const n of this.notes.filter(n => !n.historical && n.status === "conflict"
       && (!project || n.projects.includes(project.id)))) warnings.push(n.path + ": " + n.issues.join(","));
-    return { project: project ? { id: project.id, root: project.root } : null, role: this.role,
+    return { project: project ? { id: project.id, root: project.root } : null, originWorkspaceFingerprint: originWorkspace, role: this.role,
       projectRootAvailable, truthAvailable: this.role === "primary" && truthRefs.length > 0 && truthRefs.every(r => r.available), truthRefs,
       preferences: this.notes.filter(n => n.kind === "personal" && this.visible(n)).map(n => ({ id: n.id, title: n.title })),
       hits, conflicts, warnings, authority: "Project current truth > governed historical evidence > unverified working text",

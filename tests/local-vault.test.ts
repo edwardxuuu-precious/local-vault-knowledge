@@ -10,6 +10,7 @@ import { refreshLocalNavigation } from "../src/application/local-vault-navigatio
 import { exportPrivatePackage, importPackage, inspectPackage, previewPublicPackage, exportPublicPackage, previewReturnedEdits,
   initializeLocalVault, bindImportedCopy } from "../src/application/local-vault-pack.js";
 import { previewOrganization, applyOrganization } from "../src/application/local-vault-organization.js";
+import { previewCaptureFiles, applyCapture, type CaptureDraft } from "../src/application/local-vault-capture.js";
 import * as tar from "tar";
 import { createLocalVaultMcpServer } from "../src/interfaces/vault-mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -64,6 +65,103 @@ it("reads fresh Chinese context without modifying SQLite, WAL, manifests, notes 
   expect((await v.buildContext("锁屏", "/unregistered")).hits.map(n => n.id)).not.toContain("lock");
   expect(v.previewChange("lock", digest(f.raw), f.raw).changed).toBe(false);
   expect(await inventory(f.vault)).toEqual(before);
+});
+it("reads the real structured truth-file contract, safe missing files and legacy string locators without writes", async () => {
+  const f = await fixture(), project = join(f.dir, "project");
+  await mkdir(project); await writeFile(join(project, "事实.md"), "当前边界：仅本项目。");
+  await writeFile(join(project, "长文.md"), "甲".repeat(12001));
+  await writeFile(join(f.system, "config/projects.yaml"), JSON.stringify({ projects: [
+    { id: "alpha", name: "Alpha", root: project, truthFiles: [{ kind: "project_doc", path: "事实.md" }] },
+    { id: "beta", name: "Beta", root: project, truthFiles: ["不存在.md", { kind: "project_doc", path: "长文.md" }] },
+  ] }));
+  const before = await inventory(f.vault), v = await LocalVault.open(f.vault);
+  const context = await v.buildContext("锁屏", undefined, "alpha");
+  expect(context.truthAvailable).toBe(true); expect(context.truthRefs[0]?.body).toContain("仅本项目");
+  const missing = await v.buildContext("锁屏", undefined, "beta");
+  expect(missing.truthAvailable).toBe(false); expect(missing.truthRefs[0]?.available).toBe(false);
+  expect(missing.truthRefs[0]?.unavailableReason).toBe("文件不存在");
+  expect(missing.truthRefs[1]?.unavailableReason).toContain("12000");
+  expect(missing.warnings.some(w => w.includes("当前真源"))).toBe(true);
+  expect(await inventory(f.vault)).toEqual(before);
+});
+it("returns useful content rather than empty heading chunks and prioritizes matching project evidence", async () => {
+  const f = await fixture();
+  for (const [id, projects, body] of [
+    ["project-backup", ["alpha"], "# 重复备份\n\n## 结论与用法\n内容没有变化时不创建备份。\n\n## 适用边界\n仅 Alpha 项目。\n"],
+    ["heading-only", ["general"], "# 重复备份\n\n## 结论与用法\n\n## 适用边界\n"],
+    ["global-backup", ["general"], "# 重复备份\n\n## 结论与用法\n通用建议：需要恢复时才创建备份。\n\n## 适用边界\n需要自行验证。\n"],
+  ] as const) await writeFile(join(f.vault, "30_知识与经验/方法/" + id + ".md"), "---\nlocal_id: " + id + "\nprojects: " + JSON.stringify(projects) + "\n---\n" + body);
+  const results = (await LocalVault.open(f.vault)).search("重复备份", "alpha");
+  expect(results[0]?.id).toBe("project-backup");
+  expect(results.map(r => r.id)).not.toContain("heading-only");
+  expect(results.every(r => Boolean(r.snippet.replace(/^#{1,3} .*$/gmu, "").trim()))).toBe(true);
+});
+const captureDraft = (): CaptureDraft => ({ title: "导入失败先检查设备状态", kind: "experience", projects: ["alpha"],
+  observedAt: "2026-10-14T10:00:00.000Z", sources: [{ ref: "https://example.org/report", readScope: "link_only" }],
+  body: "# 导入失败先检查设备状态\n\n## 结论与用法\n发现设备锁定时先停止当前导入。\n\n## 适用边界\n仅 Alpha 的导入流程；其他项目效果未知。\n\n## 未结事项\n实际改善未知。\n" });
+it("previews meaningful capture without writes and saves only the confirmed scope; repetition produces no files", async () => {
+  const f = await fixture(), v = await LocalVault.open(f.vault), before = await inventory(f.vault);
+  const preview = await previewCaptureFiles(v, [captureDraft()]);
+  expect(await inventory(f.vault)).toEqual(before);
+  await expect(applyCapture(v, preview, preview.previewHash, false)).rejects.toThrow(/confirmation/);
+  const canonical = await inventory(f.system);
+  expect((await applyCapture(v, preview, preview.previewHash, true)).saved).toBe(1);
+  const saved = await LocalVault.open(f.vault), note = saved.get(preview.changes[0]!.id);
+  expect(note.status).toBe("unverified"); expect(note.sourceRefs).toContain("https://example.org/report");
+  expect(note.sourceContentCoverage).toBe("link_only"); expect(note.asOf).toBe("2026-10-14T10:00:00.000Z");
+  expect((await saved.buildContext("设备状态", undefined, "beta")).hits.map(n => n.id)).not.toContain(note.id);
+  const first = await inventory(f.vault);
+  expect((await applyCapture(saved, preview, preview.previewHash, true)).saved).toBe(0);
+  expect(await inventory(f.vault)).toEqual(first); expect(await inventory(f.system)).toEqual(canonical);
+  expect((await previewCaptureFiles(saved, [captureDraft()])).changes[0]?.action).toBe("reuse");
+});
+it("updates one body by reviewed base, preserves metadata and original bytes, and rejects changes after preview", async () => {
+  const f = await fixture(), initial = await LocalVault.open(f.vault), draft = captureDraft();
+  const p = await previewCaptureFiles(initial, [draft]); await applyCapture(initial, p, p.previewHash, true);
+  let v = await LocalVault.open(f.vault), note = v.get(p.changes[0]!.id);
+  const original = await readFile(join(f.vault, note.path), "utf8"), fields = note.protectedFields;
+  const update = { ...draft, targetId: note.id, baseHash: note.rawHash, body: draft.body.replace("实际改善未知。", "本次导入成功；其他场景效果未知。") };
+  const proposal = await previewCaptureFiles(v, [update]);
+  await applyCapture(v, proposal, proposal.previewHash, true); v = await LocalVault.open(f.vault); note = v.get(note.id);
+  expect(note.protectedFields).toEqual(fields); expect(note.status).toBe("unverified");
+  const histories = (await walk(f.vault)).filter(p => p.startsWith("90_审计资料/正文原版本/"));
+  expect(histories).toHaveLength(1); expect(await readFile(join(f.vault, histories[0]!), "utf8")).toBe(original);
+  const next = await previewCaptureFiles(v, [{ ...update, baseHash: note.rawHash, body: update.body + "\n补充边界。\n" }]);
+  await writeFile(join(f.vault, note.path), await readFile(join(f.vault, note.path), "utf8") + "\n独立编辑。\n");
+  await expect(applyCapture(await LocalVault.open(f.vault), next, next.previewHash, true)).rejects.toThrow(/changed/);
+});
+it("prevents duplicate-topic bodies, scope expansion, credential storage and occupied capture paths", async () => {
+  const f = await fixture(), v = await LocalVault.open(f.vault), draft = captureDraft();
+  await expect(previewCaptureFiles(v, [{ ...draft, projects: ["*"] }])).rejects.toThrow(/origin scope/);
+  await expect(previewCaptureFiles(v, [{ ...draft, path: "90_系统/knowledge/new.md" }])).rejects.toThrow(/destination/);
+  await expect(previewCaptureFiles(v, [{ ...draft, sources: [{ ref: "https://example.org/?token=private-value", readScope: "full" }] }])).rejects.toThrow(/Credential/);
+  const p = await previewCaptureFiles(v, [draft]); await applyCapture(v, p, p.previewHash, true);
+  await expect(previewCaptureFiles(await LocalVault.open(f.vault), [{ ...draft, body: draft.body + "\n新的观察。\n" }])).rejects.toThrow(/same topic/);
+});
+it("adds independent evidence to the same body without losing prior sources or making another reading copy", async () => {
+  const f = await fixture(), draft = captureDraft(), v = await LocalVault.open(f.vault);
+  const initial = await previewCaptureFiles(v, [draft]); await applyCapture(v, initial, initial.previewHash, true);
+  const nextDraft = { ...draft, sources: [{ ref: "https://example.org/second-result", readScope: "project_result" as const }] };
+  const next = await previewCaptureFiles(await LocalVault.open(f.vault), [nextDraft]);
+  expect(next.changes[0]?.action).toBe("update");
+  await applyCapture(await LocalVault.open(f.vault), next, next.previewHash, true);
+  const updated = await LocalVault.open(f.vault), note = updated.get(initial.changes[0]!.id);
+  expect(note.sourceRefs).toContain(draft.sources[0]!.ref); expect(note.sourceRefs).toContain(nextDraft.sources[0]!.ref);
+  expect(updated.notes.filter(n => !n.historical && n.id === note.id)).toHaveLength(1);
+  expect((await previewCaptureFiles(updated, [nextDraft])).changes[0]?.action).toBe("reuse");
+});
+it("binds unregistered project experience to an anonymous origin fingerprint and keeps it out of other projects", async () => {
+  const f = await fixture(), first = join(f.dir, "first-new-project"), second = join(f.dir, "second-new-project");
+  await mkdir(first); await mkdir(second);
+  const draft = { ...captureDraft(), projects: [], workspacePath: first };
+  const preview = await previewCaptureFiles(await LocalVault.open(f.vault), [draft]);
+  expect(preview.changes[0]?.projects[0]).toMatch(/^workspace:[a-f0-9]{24}$/);
+  await applyCapture(await LocalVault.open(f.vault), preview, preview.previewHash, true);
+  const v = await LocalVault.open(f.vault), id = preview.changes[0]!.id;
+  expect((await v.buildContext("设备状态", first)).hits.map(n => n.id)).toContain(id);
+  expect((await v.buildContext("设备状态", second)).hits.map(n => n.id)).not.toContain(id);
+  expect((await v.buildContext("设备状态", first)).warnings.join(" ")).toContain("reversible_trial_only");
+  expect((await v.buildContext("设备状态", first)).truthAvailable).toBe(false);
 });
 it("keeps manual edits unverified after rename and rejects forged metadata, stale bases and duplicate IDs", async () => {
   const f = await fixture();

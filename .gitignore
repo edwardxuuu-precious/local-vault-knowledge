@@ -3,3 +3,7 @@ dist/
 *.tar.gz
 .env
 *.sqlite*
+.context-router-storage.json
+.vault-import.json
+.npm-cache/
+.distribution-*/

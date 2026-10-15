@@ -6,6 +6,7 @@
 - display_title、aliases：非保护展示字段，用于短标题与历史名称查找。
 - projects：独立阅读正文的范围。已有受保护对象保留其原项目与 canonical 关联。
 - created_at：保留原值。移动包另保存文件原创建时间，避免用导入时间替代原时间。
+- observed_at：实际观察日期；sources 记录定位、阅读程度及可选版本。source_content_coverage 区分只读链接、片段、全文与已核对项目结果。
 - 原有身份、状态、项目、权限与来源保护字段保持。
 - 编辑内容 status=unverified。originalStatus 仅描述原证据版本。
 
@@ -17,9 +18,11 @@ search(query, project?, limit=5) 返回片段、ID、位置、范围、原状态
 
 get(id) 返回当前完整正文及原版本信息。重复 ID、保护字段漂移、不同当前版本竞争或 restricted 内容会拒绝使用。历史记录显式带 historical=true。
 
-buildContext(task, workspace?, project?) 绑定项目，读取最多八个明确声明的相对真源文件并带哈希、内容、可用性。单文件超过读取预算或含敏感凭据模式时只报告不可用。未登记项目只使用明确通用参考与个人原则，未加载真源不声称事实已核验。
+buildContext(task, workspace?, project?) 绑定项目，读取最多八个明确声明的相对真源文件并带哈希、内容、可用性和不可用原因；兼容字符串与带 path 的注册表定位。未登记项目使用通用参考、个人原则及同工作区指纹的待验证经验；后者仅用于 test_only + reversible_trial_only。未加载全部真源不声称事实已核验。
 
 previewChange(id, baseHash, proposedRaw) 比较基础版本、保护字段、精确重复和可能重复。返回差异与 previewHash；没有 apply 或生命周期转换。
+
+日常 CLI 的 capture-preview 接收有界正文、来源、观察日期、明确范围及可选 targetId/baseHash，返回实际正文差异、重复候选与确认哈希。capture-save 只应用用户确认的同一预览到普通阅读正文；保留原身份、创建时间与来源，保持待验证。完全重复复用；独立编辑、保护字段或范围改变须重新审阅。只有正文实质更新时保存按哈希去重的原字节，不追加规范事件或创建全库备份。
 
 ## 私人包与工作副本
 

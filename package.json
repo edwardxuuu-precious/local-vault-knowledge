@@ -1,6 +1,6 @@
 {
   "name": "local-vault-knowledge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Local-first Markdown knowledge and bounded AI memory",
   "type": "module",
   "license": "MIT",
@@ -13,7 +13,8 @@
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "npm run build && vitest run",
+    "check:distribution": "node scripts/check-distribution.mjs"
   },
   "dependencies": {
     "commander": "15.0.0",
@@ -21,12 +22,31 @@
     "yaml": "2.9.0",
     "tar": "7.5.22",
     "@modelcontextprotocol/sdk": "1.30.0",
-    "zod": "4.4.3"
+    "zod": "4.4.3",
+    "sql.js": "1.14.2"
   },
   "devDependencies": {
     "esbuild": "0.25.12",
     "typescript": "5.9.3",
     "vitest": "4.1.10",
     "@types/node": "24.10.1"
-  }
+  },
+  "files": [
+    "dist/",
+    "src/",
+    "skills/",
+    "examples/",
+    "scripts/check-distribution.mjs",
+    "tests/",
+    "tsconfig.json",
+    "build.mjs",
+    "README.md",
+    "FORMAT.md",
+    "CODEX-SETUP.md",
+    "RELEASE.md",
+    "LICENSE",
+    "THIRD_PARTY.md",
+    "THIRD_PARTY_LICENSES.txt",
+    "licenses/"
+  ]
 }

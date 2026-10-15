@@ -1,0 +1,8 @@
+schemaVersion: 1
+projects:
+  - id: demo-project
+    name: Demo project
+    root: /absolute/path/project
+    truthFiles:
+      - AGENTS.md
+      - README.md

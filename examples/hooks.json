@@ -1,0 +1,30 @@
+{
+  "description": "Optional bounded local knowledge; review before enabling.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/absolute/path/local-vault-knowledge/src/interfaces/local-knowledge-hook-command.mjs\" --event UserPromptSubmit",
+            "timeout": 6,
+            "additionalContextLimit": 0
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "^startup$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/absolute/path/local-vault-knowledge/src/interfaces/local-knowledge-hook-command.mjs\" --event SessionStart",
+            "timeout": 6,
+            "additionalContextLimit": 0
+          }
+        ]
+      }
+    ]
+  }
+}
